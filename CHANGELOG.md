@@ -35,6 +35,6 @@ All notable changes to the **AgentFusionPurity** autonomous nuclear confinement 
   - `PullPayoutButton.tsx`: Recovery interface calling `claim_payout()` for buffered balances.
 
 ### Deployment & Tooling (`scripts/`)
-- `scripts/deploy_studionet.py`: Automated contract deployment to GenLayer StudioNet (Chain 61999). Deployed at `0x5D3D85a66429bdFD9761377B4b66158a54f1CC91`.
+- `scripts/deploy_studionet.py`: Automated contract deployment to GenLayer StudioNet (Chain 61999). Deployed at `0x077c23EA77BDA377B0f92079aDdfc945845c51c0`.
 - `scripts/verify_lifecycle.py`: Standalone protocol lifecycle simulation script.
 - `scripts/generate_logo.py`: High-resolution Tokamak branding generator (`logo.png`).

@@ -33,8 +33,8 @@ Traditional EVM smart contracts cannot read or parse soft X-ray spectrometry, la
 | **Network** | GenLayer StudioNet |
 | **Chain ID** | `61999` (Hex: `0xF22F`) |
 | **RPC Endpoint** | `https://studio.genlayer.com/api` |
-| **Contract Address** | `0x5D3D85a66429bdFD9761377B4b66158a54f1CC91` |
-| **Explorer / Studio** | [View on GenLayer Studio](https://studio.genlayer.com/address/0x5D3D85a66429bdFD9761377B4b66158a54f1CC91) |
+| **Contract Address** | `0x077c23EA77BDA377B0f92079aDdfc945845c51c0` |
+| **Explorer / Studio** | [View on GenLayer Studio](https://studio.genlayer.com/address/0x077c23EA77BDA377B0f92079aDdfc945845c51c0) |
 | **Production dApp** | [https://agentfusionpurity.vercel.app](https://agentfusionpurity.vercel.app) |
 
 ---
