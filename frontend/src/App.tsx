@@ -1,10 +1,10 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import {
-  Navbar,
-} from './components/Navbar';
-import { StatsOverview } from './components/StatsOverview';
+import { Navbar } from './components/Navbar';
+import { ScadaHeaderRibbon } from './components/ScadaHeaderRibbon';
 import { TokamakReactorRadar } from './components/TokamakReactorRadar';
-import { PolicyCard } from './components/PolicyCard';
+import { ReactorFacilityMatrix, KNOWN_FACILITIES, ReactorFacilityInfo } from './components/ReactorFacilityMatrix';
+import { RoleCommandDeck } from './components/RoleCommandDeck';
+import { FusionPulseStream } from './components/FusionPulseStream';
 import { PullPayoutButton } from './components/PullPayoutButton';
 import { CreatePolicyModal } from './components/CreatePolicyModal';
 import { SubmitTelemetryModal } from './components/SubmitTelemetryModal';
@@ -23,15 +23,16 @@ import {
 } from './config/genlayer';
 import {
   RefreshCw,
-  Filter,
   Search,
   ExternalLink,
   Flame,
   Radio,
   Layers,
   Atom,
-  AlertCircle,
+  Sliders,
+  Cpu,
 } from 'lucide-react';
+import { formatGen } from './utils/formatters';
 
 export const App: React.FC = () => {
   const [account, setAccount] = useState<string>('');
@@ -41,8 +42,8 @@ export const App: React.FC = () => {
   const [stats, setStats] = useState<ContractStats | null>(null);
   const [policies, setPolicies] = useState<FusionPolicyData[]>([]);
   const [selectedPolicyId, setSelectedPolicyId] = useState<string | null>(null);
-  const [filterStatus, setFilterStatus] = useState<string>('ALL');
-  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [selectedFacilityId, setSelectedFacilityId] = useState<string>('SPARC-EXPERIMENTAL-01');
+  const [userRole, setUserRole] = useState<string>('OBSERVER');
   const [loading, setLoading] = useState<boolean>(true);
   const [refreshing, setRefreshing] = useState<boolean>(false);
 
@@ -78,6 +79,7 @@ export const App: React.FC = () => {
   const disconnectWallet = () => {
     setAccount('');
     setBalance('0.000');
+    setUserRole('OBSERVER');
   };
 
   // Listen to network and accounts changes
@@ -103,7 +105,6 @@ export const App: React.FC = () => {
       eth.on('accountsChanged', handleAccountsChanged);
       eth.on('chainChanged', handleChainChanged);
 
-      // Check current accounts
       eth.request({ method: 'eth_accounts' }).then(async (accounts: string[]) => {
         if (accounts.length > 0) {
           const acc = accounts[0].toLowerCase();
@@ -147,7 +148,6 @@ export const App: React.FC = () => {
         if (policiesRes) {
           const parsed = typeof policiesRes === 'string' ? JSON.parse(policiesRes) : policiesRes;
           if (Array.isArray(parsed)) {
-            // Sort newest first
             const sorted = [...parsed].reverse();
             setPolicies(sorted);
             if (!selectedPolicyId && sorted.length > 0) {
@@ -159,10 +159,19 @@ export const App: React.FC = () => {
         console.warn('Error reading policies:', e);
       }
 
-      // Refresh wallet balance
+      // Refresh wallet balance and role
       if (account) {
         const bal = await fetchStudionetBalance(account);
         setBalance(bal);
+
+        if (selectedPolicyId) {
+          try {
+            const role = await readContract('get_user_role', [selectedPolicyId, account], contractAddress);
+            setUserRole(String(role || 'OBSERVER'));
+          } catch {
+            setUserRole('OBSERVER');
+          }
+        }
       }
     } finally {
       setLoading(false);
@@ -172,42 +181,29 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     fetchAllData();
-    const interval = setInterval(fetchAllData, 15000);
+    const interval = setInterval(fetchAllData, 12000);
     return () => clearInterval(interval);
   }, [fetchAllData]);
 
-  // Filtered policies list
-  const filteredPolicies = policies.filter((p) => {
-    const matchesSearch =
-      p.policy_id.includes(searchQuery) ||
-      p.reactor_facility_id.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      p.tokamak_operator.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      p.sponsor.toLowerCase().includes(searchQuery.toLowerCase());
+  const selectedPolicy = policies.find((p) => p.policy_id === selectedPolicyId) || policies[0] || null;
 
-    if (!matchesSearch) return false;
-
-    if (filterStatus === 'ACTIVE') {
-      return p.status === 0 || p.status === 1 || p.status === 2;
-    }
-    if (filterStatus === 'CERTIFIED') {
-      return p.status === 3;
-    }
-    if (filterStatus === 'PARTIAL') {
-      return p.status === 4;
-    }
-    if (filterStatus === 'QUENCHED') {
-      return p.status === 5;
-    }
-    if (filterStatus === 'DISPUTED') {
-      return p.status === 6;
-    }
-    return true;
-  });
+  const totalLockedGen = stats ? formatGen(stats.total_fusion_locked) : '0.000';
+  const totalPoliciesCount = policies.length;
+  const uniqueFacilitiesCount = new Set(policies.map((p) => p.reactor_facility_id.toUpperCase())).size || KNOWN_FACILITIES.length;
 
   return (
     <ErrorBoundary>
-      <div className="min-h-screen bg-[#04030A] text-slate-100 flex flex-col justify-between">
-        {/* Navbar */}
+      <div className="min-h-screen bg-[#04030A] text-slate-100 flex flex-col justify-between selection:bg-cyan-500/30 selection:text-cyan-200">
+        {/* SCADA Status Ribbon */}
+        <ScadaHeaderRibbon
+          account={account}
+          userRole={userRole}
+          totalPolicies={totalPoliciesCount}
+          totalLockedGen={totalLockedGen}
+          activeChambers={uniqueFacilitiesCount}
+        />
+
+        {/* Primary Navbar */}
         <Navbar
           account={account}
           balance={balance}
@@ -217,130 +213,75 @@ export const App: React.FC = () => {
           onContractAddressChange={fetchAllData}
         />
 
-        {/* Main Content Area */}
-        <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8 flex-1 w-full">
-          {/* Stats Overview Banner */}
-          <StatsOverview
-            stats={stats}
+        {/* Main SCADA Operations Deck */}
+        <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6 flex-1 w-full">
+          {/* Top Deck: Dual-Monitor Tokamak Telemetry & Multi-Chamber Facility Matrix */}
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+            <div className="lg:col-span-7">
+              <TokamakReactorRadar
+                policies={policies}
+                selectedPolicyId={selectedPolicyId}
+                onSelectPolicy={(id) => {
+                  setSelectedPolicyId(id);
+                  const p = policies.find((item) => item.policy_id === id);
+                  if (p) setSelectedFacilityId(p.reactor_facility_id.toUpperCase());
+                }}
+              />
+            </div>
+
+            <div className="lg:col-span-5">
+              <ReactorFacilityMatrix
+                selectedFacilityId={selectedFacilityId}
+                onSelectFacility={(id) => {
+                  setSelectedFacilityId(id);
+                  const p = policies.find((item) => item.reactor_facility_id.toUpperCase() === id);
+                  if (p) setSelectedPolicyId(p.policy_id);
+                }}
+                policies={policies}
+                onQuickCreate={() => setIsCreateOpen(true)}
+              />
+            </div>
+          </div>
+
+          {/* Middle Deck: Role-Based Command Console */}
+          <RoleCommandDeck
             policies={policies}
-            onOpenCreateModal={() => setIsCreateOpen(true)}
+            selectedPolicy={selectedPolicy}
+            account={account}
+            onRefresh={fetchAllData}
+            onOpenCreate={() => setIsCreateOpen(true)}
+            onOpenSubmitTelemetry={(p) => setTelemetryPolicy(p)}
+            onOpenAppeal={(p) => setAppealPolicy(p)}
+            onInspectSpectrometry={(p) => setInspectPolicy(p)}
           />
 
-          {/* Interactive Tokamak Reactor Radar */}
-          <TokamakReactorRadar
+          {/* Live Telemetry Pulse Ledger / Stream */}
+          <FusionPulseStream
             policies={policies}
             selectedPolicyId={selectedPolicyId}
-            onSelectPolicy={(id) => setSelectedPolicyId(id)}
+            onSelectPolicy={(id) => {
+              setSelectedPolicyId(id);
+              const p = policies.find((item) => item.policy_id === id);
+              if (p) setSelectedFacilityId(p.reactor_facility_id.toUpperCase());
+            }}
+            onInspectSpectrometry={(p) => setInspectPolicy(p)}
+            onSubmitTelemetry={(p) => setTelemetryPolicy(p)}
+            onAppeal={(p) => setAppealPolicy(p)}
           />
 
-          {/* Pull-Payment Beneficiary Ledger */}
+          {/* Pull-Payment Beneficiary Ledger Dock */}
           <PullPayoutButton
             account={account}
             onClaimSuccess={fetchAllData}
           />
-
-          {/* Pulse Policies Explorer & Action Bar */}
-          <div className="space-y-4">
-            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
-              <div>
-                <h2 className="text-2xl font-bold font-space text-white tracking-tight flex items-center gap-2">
-                  <Atom className="w-6 h-6 text-cyan-400" />
-                  Fusion Pulse Policies &amp; Confinement Ledgers
-                </h2>
-                <p className="text-xs text-slate-400 font-mono mt-0.5">
-                  Showing {filteredPolicies.length} of {policies.length} registered experimental pulse runs
-                </p>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
-                {/* Search */}
-                <div className="relative flex-1 sm:w-60">
-                  <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-                  <input
-                    type="text"
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    placeholder="Search by facility or ID..."
-                    className="w-full pl-9 pr-3 py-2 bg-[#0D081B] border border-[#2A1B4E] rounded-xl text-xs font-mono text-white focus:border-cyan-500 focus:outline-none"
-                  />
-                </div>
-
-                {/* Filter Tabs */}
-                <div className="flex items-center gap-1 bg-[#0D081B] p-1 rounded-xl border border-[#2A1B4E] overflow-x-auto text-xs font-mono">
-                  {['ALL', 'ACTIVE', 'CERTIFIED', 'PARTIAL', 'QUENCHED', 'DISPUTED'].map((tab) => (
-                    <button
-                      key={tab}
-                      onClick={() => setFilterStatus(tab)}
-                      className={`px-3 py-1.5 rounded-lg transition ${
-                        filterStatus === tab
-                          ? 'bg-gradient-to-r from-cyan-500 to-violet-600 text-white font-bold'
-                          : 'text-slate-400 hover:text-white'
-                      }`}
-                    >
-                      {tab}
-                    </button>
-                  ))}
-                </div>
-
-                {/* Refresh */}
-                <button
-                  onClick={fetchAllData}
-                  disabled={refreshing}
-                  className="p-2 bg-[#0D081B] border border-[#2A1B4E] hover:border-cyan-500 text-slate-400 hover:text-cyan-400 rounded-xl transition"
-                  title="Refresh policies"
-                >
-                  <RefreshCw className={`w-4 h-4 ${refreshing ? 'animate-spin text-cyan-400' : ''}`} />
-                </button>
-              </div>
-            </div>
-
-            {/* Policies Cards Grid */}
-            {loading ? (
-              <div className="p-16 text-center rounded-3xl bg-[#0D081B] border border-[#2A1B4E]">
-                <div className="w-10 h-10 border-3 border-cyan-500/20 border-t-cyan-400 rounded-full animate-spin mx-auto mb-4" />
-                <p className="text-sm font-mono text-slate-400">Loading GenLayer StudioNet telemetry...</p>
-              </div>
-            ) : filteredPolicies.length === 0 ? (
-              <div className="p-16 text-center rounded-3xl bg-[#0D081B] border border-[#2A1B4E]">
-                <Flame className="w-12 h-12 text-slate-600 mx-auto mb-3" />
-                <h3 className="text-lg font-bold font-space text-white mb-1">No Fusion Policies Found</h3>
-                <p className="text-xs text-slate-400 font-mono mb-5">
-                  {policies.length === 0
-                    ? 'No experimental shot escrows have been created on this contract yet.'
-                    : 'No policies match the selected filter criteria.'}
-                </p>
-                <button
-                  onClick={() => setIsCreateOpen(true)}
-                  className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-r from-cyan-500 to-violet-600 text-white font-space font-bold text-xs tracking-wide shadow-lg shadow-cyan-500/20"
-                >
-                  <Flame className="w-4 h-4 text-amber-200" />
-                  Create First Shot Escrow
-                </button>
-              </div>
-            ) : (
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                {filteredPolicies.map((policy) => (
-                  <PolicyCard
-                    key={policy.policy_id}
-                    policy={policy}
-                    account={account}
-                    onRefresh={fetchAllData}
-                    onSubmitTelemetry={(p) => setTelemetryPolicy(p)}
-                    onInspectSpectrometry={(p) => setInspectPolicy(p)}
-                    onAppeal={(p) => setAppealPolicy(p)}
-                  />
-                ))}
-              </div>
-            )}
-          </div>
         </main>
 
-        {/* Footer */}
-        <footer className="w-full border-t border-[#2A1B4E] bg-[#04030A] py-8 mt-12">
+        {/* Industrial Footer */}
+        <footer className="w-full border-t border-[#1F133A] bg-[#05030D] py-6 mt-8">
           <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs font-mono text-slate-500">
             <div className="flex items-center gap-2">
-              <span className="w-2 h-2 rounded-full bg-cyan-400" />
-              <span>AgentFusionPurity &middot; GenLayer StudioNet (Chain 61999)</span>
+              <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
+              <span>AgentFusionPurity &middot; SCADA Magnetic Confinement Oracle &middot; StudioNet 61999</span>
             </div>
             <div className="flex items-center gap-6">
               <a
