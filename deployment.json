@@ -1,0 +1,13 @@
+{
+  "network": "studionet",
+  "chainId": 61999,
+  "chainIdHex": "0xF22F",
+  "rpcUrl": "https://studio.genlayer.com/api",
+  "contractAddress": "0x5D3D85a66429bdFD9761377B4b66158a54f1CC91",
+  "transactionHash": "0xd12c027528bc8a2e0e3488e69702f6b37686ad62d1521a0db7ec07767721b466",
+  "deployerAddress": "0xF34587A45C397281Ef6BDd839d4A1de2DEe393ad",
+  "status": "5",
+  "deployedAt": "2026-10-23T16:45:38Z",
+  "liveDappUrl": "https://agentfusionpurity.vercel.app",
+  "githubRepo": "https://github.com/tuannguyen1995/AgentFusionPurity"
+}
