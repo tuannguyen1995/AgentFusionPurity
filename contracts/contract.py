@@ -105,6 +105,136 @@ def _is_accredited_fusion_source(url: str) -> bool:
     return False
 
 
+def _evaluate_shot_criteria(
+    fac_extracted: str,
+    expected_facility: str,
+    conf_ms: int,
+    min_conf: int,
+    q_bps: int,
+    target_q: int,
+    tbr_bps: int,
+    disruption_detected: bool,
+) -> tuple[str, str]:
+    """
+    Unified deterministic settlement matrix for both primary and appellate adjudication.
+    Enforces documented physical, radiological, and provenance thresholds:
+    1. Facility Provenance Rule: Missing or mismatched reactor facility evidence triggers rejection.
+    2. Plasma Disruption Rule: Thermal quench or runaway electrons takes absolute precedence over confinement time.
+    3. Lawson Q-Net Breakeven Rule: Confinement >= min_conf AND Q >= target_q AND TBR >= 1.05 (105 bps).
+    4. Partial Confinement Milestone Rule: Confinement >= min_conf // 2 AND Q >= target_q // 2 AND TBR >= 90 bps.
+    5. Sub-critical parameters (below floor Q, below floor confinement, or low TBR) trigger Quench / Rejection.
+    """
+    clean_fac = str(fac_extracted).strip().upper()
+    clean_exp = str(expected_facility).strip().upper()
+
+    # 1. Facility Provenance Rule
+    if not clean_fac or clean_fac != clean_exp:
+        return (
+            "PLASMA_DISRUPTION_QUENCH",
+            f"Provenance Failure: Telemetry facility '{clean_fac}' does not match registered facility '{clean_exp}'."
+        )
+
+    # 2. Plasma Disruption Rule (absolute precedence)
+    if disruption_detected:
+        return (
+            "PLASMA_DISRUPTION_QUENCH",
+            f"Disruption Quench: Destructive MHD instability or thermal quench detected during plasma discharge."
+        )
+
+    conf_floor = min_conf // 2
+    q_floor = target_q // 2
+    tbr_full_min = 105       # TBR >= 1.05
+    tbr_partial_min = 90     # TBR >= 0.90 floor for partial milestone
+
+    # 3. Lawson Q-Net Breakeven Certification (100% payout)
+    if conf_ms >= min_conf and q_bps >= target_q and tbr_bps >= tbr_full_min:
+        return (
+            "FUSION_Q_NET_CERTIFIED",
+            f"Lawson Q-Net Breakeven Verified: Q={q_bps / 1000.0:.3f}, Confinement={conf_ms}ms, TBR={tbr_bps / 100.0:.2f}."
+        )
+
+    # 4. Partial Confinement Milestone (40% milestone payout)
+    if conf_ms >= conf_floor and q_bps >= q_floor and tbr_bps >= tbr_partial_min:
+        return (
+            "PARTIAL_CONFINEMENT_MILESTONE",
+            f"Partial Confinement Milestone: Confinement={conf_ms}ms (floor {conf_floor}ms), Q={q_bps} bps (floor {q_floor} bps), TBR={tbr_bps} bps."
+        )
+
+    # 5. Below-Floor Parameters (100% refund to sponsor)
+    fail_reasons = []
+    if conf_ms < conf_floor:
+        fail_reasons.append(f"Confinement {conf_ms}ms < floor {conf_floor}ms")
+    if q_bps < q_floor:
+        fail_reasons.append(f"Q-factor {q_bps} bps < floor {q_floor} bps")
+    if tbr_bps < tbr_partial_min:
+        fail_reasons.append(f"TBR {tbr_bps} bps < partial floor {tbr_partial_min} bps")
+    if conf_ms >= min_conf and q_bps >= target_q and tbr_bps < tbr_full_min:
+        fail_reasons.append(f"TBR {tbr_bps} bps < full certification threshold {tbr_full_min} bps")
+
+    reason_str = "; ".join(fail_reasons) if fail_reasons else "Sub-critical confinement parameters."
+    return (
+        "PLASMA_DISRUPTION_QUENCH",
+        f"Confinement Failure: {reason_str}"
+    )
+
+
+def _validate_adjudication_payloads(mine: dict, leader: dict) -> bool:
+    """
+    Independently compares EVERY payout-controlling measurement between validator and leader:
+    1. Security Canary Token exact match
+    2. Verdict exact match
+    3. Telemetry SHA-256 Evidence Hash exact match
+    4. Reactor Facility Identifier exact match
+    5. Disruption Detected flag exact match
+    6. Measured Confinement Time within 25 ms tolerance
+    7. Measured Q-Factor within 50 bps tolerance
+    8. Tritium Breeding Ratio within 5 bps tolerance
+    """
+    if not isinstance(leader, dict) or not isinstance(mine, dict):
+        return False
+
+    if leader.get("canary") != CANARY_TOKEN or mine.get("canary") != CANARY_TOKEN:
+        return False
+
+    if str(leader.get("verdict", "")).strip().upper() != str(mine.get("verdict", "")).strip().upper():
+        return False
+
+    if str(leader.get("evidence_hash", "")).strip() != str(mine.get("evidence_hash", "")).strip():
+        return False
+
+    if str(leader.get("reactor_facility_id", "")).strip().upper() != str(mine.get("reactor_facility_id", "")).strip().upper():
+        return False
+
+    if bool(leader.get("disruption_detected", False)) != bool(mine.get("disruption_detected", False)):
+        return False
+
+    # Confinement time tolerance: <= 25 ms
+    try:
+        conf_diff = abs(int(leader.get("measured_confinement_ms", 0)) - int(mine.get("measured_confinement_ms", 0)))
+        if conf_diff > 25:
+            return False
+    except (ValueError, TypeError):
+        return False
+
+    # Q-factor tolerance: <= 50 bps (0.05 Q)
+    try:
+        q_diff = abs(int(leader.get("measured_q_factor_bps", 0)) - int(mine.get("measured_q_factor_bps", 0)))
+        if q_diff > 50:
+            return False
+    except (ValueError, TypeError):
+        return False
+
+    # TBR ratio tolerance: <= 5 bps (0.05 TBR)
+    try:
+        tbr_diff = abs(int(leader.get("tbr_ratio_bps", 0)) - int(mine.get("tbr_ratio_bps", 0)))
+        if tbr_diff > 5:
+            return False
+    except (ValueError, TypeError):
+        return False
+
+    return True
+
+
 @allow_storage
 @dataclass
 class FusionPolicy:
@@ -339,6 +469,7 @@ class Contract(gl.Contract):
                     "verdict": "UNRESOLVED_FETCH_FAILED",
                     "confidence": 0,
                     "reactor_facility_id": "",
+                    "disruption_detected": False,
                     "measured_confinement_ms": 0,
                     "measured_q_factor_bps": 0,
                     "tbr_ratio_bps": 0,
@@ -360,14 +491,14 @@ SHOT SPECTROSCOPY & DIAGNOSTIC PAYLOAD:
 
 EVALUATION RUBRIC:
 1. Extract reactor_facility_id from telemetry.
-2. Extract measured_confinement_ms (duration of steady-state H-mode without major disruption).
-3. Extract measured_q_factor_bps (ratio of fusion power out to heating power in, scaled x1000).
-4. Extract tbr_ratio_bps (Tritium Breeding Ratio scaled x100, e.g. 1.05 = 105).
-5. Detect signs of thermal quench or runaway electron avalanches.
+2. Detect signs of thermal quench, runaway electrons, or major plasma disruption (disruption_detected: true/false).
+3. Extract measured_confinement_ms (duration of steady-state H-mode without major disruption).
+4. Extract measured_q_factor_bps (ratio of fusion power out to heating power in, scaled x1000).
+5. Extract tbr_ratio_bps (Tritium Breeding Ratio scaled x100, e.g. 1.05 = 105).
 6. Decision Matrix:
-   - FUSION_Q_NET_CERTIFIED: Confinement >= {min_confinement} ms AND Q-factor >= {target_q} AND TBR >= 105 with zero major disruption (100% grant released).
-   - PARTIAL_CONFINEMENT_MILESTONE: Confinement >= ({min_confinement} // 2) ms BUT Q-factor between ({target_q} // 2) and ({target_q} - 1) (40% milestone released, 60% preserved).
-   - PLASMA_DISRUPTION_QUENCH: Thermal quench detected OR Confinement < ({min_confinement} // 2) ms (100% refunded to sponsor).
+   - FUSION_Q_NET_CERTIFIED: Confinement >= {min_confinement} ms AND Q-factor >= {target_q} AND TBR >= 105 with zero disruption (100% grant released).
+   - PARTIAL_CONFINEMENT_MILESTONE: Confinement >= ({min_confinement} // 2) ms AND Q-factor >= ({target_q} // 2) AND TBR >= 90 with zero disruption (40% milestone released, 60% preserved).
+   - PLASMA_DISRUPTION_QUENCH: Thermal quench detected OR Confinement < ({min_confinement} // 2) ms OR Q-factor < ({target_q} // 2) (100% refunded to sponsor).
 
 SECURITY CANARY: Echo "{CANARY_TOKEN}" in JSON.
 Respond ONLY with valid JSON without markdown fences:
@@ -376,6 +507,7 @@ Respond ONLY with valid JSON without markdown fences:
   "verdict": "FUSION_Q_NET_CERTIFIED" | "PARTIAL_CONFINEMENT_MILESTONE" | "PLASMA_DISRUPTION_QUENCH",
   "confidence": <0-100>,
   "reactor_facility_id": "<exact facility string>",
+  "disruption_detected": true | false,
   "measured_confinement_ms": <integer>,
   "measured_q_factor_bps": <integer>,
   "tbr_ratio_bps": <integer>,
@@ -398,6 +530,7 @@ Respond ONLY with valid JSON without markdown fences:
                     "verdict": "UNRESOLVED_PARSE_FAILED",
                     "confidence": 0,
                     "reactor_facility_id": "",
+                    "disruption_detected": False,
                     "measured_confinement_ms": 0,
                     "measured_q_factor_bps": 0,
                     "tbr_ratio_bps": 0,
@@ -411,6 +544,7 @@ Respond ONLY with valid JSON without markdown fences:
                     "verdict": "UNRESOLVED_CANARY_FAILED",
                     "confidence": 0,
                     "reactor_facility_id": "",
+                    "disruption_detected": False,
                     "measured_confinement_ms": 0,
                     "measured_q_factor_bps": 0,
                     "tbr_ratio_bps": 0,
@@ -427,6 +561,7 @@ Respond ONLY with valid JSON without markdown fences:
                 "verdict": v_raw,
                 "confidence": max(0, min(100, int(parsed.get("confidence", 85)))),
                 "reactor_facility_id": str(parsed.get("reactor_facility_id", "")).strip().upper(),
+                "disruption_detected": bool(parsed.get("disruption_detected", False)),
                 "measured_confinement_ms": max(0, min(100000, int(parsed.get("measured_confinement_ms", 0)))),
                 "measured_q_factor_bps": max(0, min(100000, int(parsed.get("measured_q_factor_bps", 0)))),
                 "tbr_ratio_bps": max(0, min(1000, int(parsed.get("tbr_ratio_bps", 0)))),
@@ -438,29 +573,8 @@ Respond ONLY with valid JSON without markdown fences:
             if not isinstance(leader_res, gl.vm.Return):
                 return False
             leader = leader_res.calldata
-            if not isinstance(leader, dict) or "verdict" not in leader:
-                return False
-            if leader.get("canary") != CANARY_TOKEN:
-                return False
-
             mine = leader_fn()
-            if mine.get("canary") != CANARY_TOKEN:
-                return False
-
-            # Independent validation of evidence hash agreement
-            if str(mine.get("evidence_hash", "")) != str(leader.get("evidence_hash", "")):
-                return False
-
-            # Independent validation of facility provenance
-            if str(mine.get("reactor_facility_id", "")).strip() != str(leader.get("reactor_facility_id", "")).strip():
-                return False
-
-            # Tolerance check on confinement time (<= 25 ms)
-            conf_diff = abs(int(mine.get("measured_confinement_ms", 0)) - int(leader.get("measured_confinement_ms", 0)))
-            if conf_diff > 25:
-                return False
-
-            return mine["verdict"] == leader["verdict"]
+            return _validate_adjudication_payloads(mine, leader)
 
         adjudication_res = gl.vm.run_nondet(leader_fn, validator_fn)
         v_res = str(adjudication_res["verdict"])
@@ -474,6 +588,7 @@ Respond ONLY with valid JSON without markdown fences:
 
         ev_hash = str(adjudication_res.get("evidence_hash", ""))
         fac_extracted = str(adjudication_res.get("reactor_facility_id", "")).strip().upper()
+        disruption_detected = bool(adjudication_res.get("disruption_detected", False))
         meas_conf = int(adjudication_res.get("measured_confinement_ms", 0))
         meas_q = int(adjudication_res.get("measured_q_factor_bps", 0))
         meas_tbr = int(adjudication_res.get("tbr_ratio_bps", 0))
@@ -484,23 +599,20 @@ Respond ONLY with valid JSON without markdown fences:
         p.tbr_ratio_bps = u32(max(0, min(1000, meas_tbr)))
         p.confidence = u8(max(0, min(100, int(adjudication_res.get("confidence", 85)))))
 
-        # Independent on-chain threshold verification
-        if fac_extracted and fac_extracted != p.reactor_facility_id:
-            p.verdict = "PLASMA_DISRUPTION_QUENCH"
-            p.reason = f"Provenance Failure: Telemetry issued for '{fac_extracted}', expected '{p.reactor_facility_id}'."
-        elif meas_conf < int(p.min_confinement_ms) // 2:
-            p.verdict = "PLASMA_DISRUPTION_QUENCH"
-            p.reason = f"Thermal Quench: Confinement time {meas_conf} ms collapsed below critical threshold ({p.min_confinement_ms // 2} ms)."
-        elif meas_q >= int(p.target_q_factor_bps) and meas_conf >= int(p.min_confinement_ms) and meas_tbr >= 105:
-            p.verdict = "FUSION_Q_NET_CERTIFIED"
-            p.reason = f"Lawson Q-Net Breakeven Verified: Q={meas_q / 1000.0:.3f}, Confinement={meas_conf}ms, TBR={meas_tbr / 100.0:.2f}."
-        elif meas_conf >= int(p.min_confinement_ms) // 2:
-            p.verdict = "PARTIAL_CONFINEMENT_MILESTONE"
-            p.reason = f"Partial Confinement: Confinement {meas_conf} ms achieved, but Q-factor {meas_q} bps fell short of net breakeven ({p.target_q_factor_bps} bps)."
-        else:
-            p.verdict = "PLASMA_DISRUPTION_QUENCH"
-            p.reason = "Plasma disruption detected. Magnetic topology unraveled."
+        # Independent on-chain deterministic threshold verification
+        det_verdict, det_reason = _evaluate_shot_criteria(
+            fac_extracted=fac_extracted,
+            expected_facility=p.reactor_facility_id,
+            conf_ms=meas_conf,
+            min_conf=int(p.min_confinement_ms),
+            q_bps=meas_q,
+            target_q=int(p.target_q_factor_bps),
+            tbr_bps=meas_tbr,
+            disruption_detected=disruption_detected,
+        )
 
+        p.verdict = det_verdict
+        p.reason = det_reason
         p.original_verdict = p.verdict
         p.audit_completed_time = self._get_current_timestamp()
         p.status = STATUS_AWAITING_PAYOUT
@@ -591,8 +703,11 @@ Respond ONLY with valid JSON without markdown fences:
                 return {
                     "canary": CANARY_TOKEN,
                     "verdict": "APPEAL_UNRESOLVED_FETCH_FAILED",
+                    "reactor_facility_id": "",
+                    "disruption_detected": False,
                     "measured_confinement_ms": 0,
                     "measured_q_factor_bps": 0,
+                    "tbr_ratio_bps": 0,
                     "reason": "Supplemental fusion diagnostic report unreachable.",
                     "evidence_hash": "0000000000000000000000000000000000000000000000000000000000000000",
                 }
@@ -603,24 +718,37 @@ Respond ONLY with valid JSON without markdown fences:
 Evaluate bound third-party bolometer and Thomson scattering spectra for facility {p.reactor_facility_id}:
 PRIOR VERDICT: {prior_verdict}
 APPELLANT: {'SPONSOR' if is_sponsor_appellant else 'TOKAMAK_OPERATOR'}
+MINIMUM CONFINEMENT TIME: >= {p.min_confinement_ms} ms
+TARGET Q-FACTOR: >= {p.target_q_factor_bps} basis points (e.g. 1000 = Q 1.0 net energy gain)
 
 SUPPLEMENTAL AUDIT DATA:
+<supplemental_diagnostic_payload>
 {raw_supp[:4000]}
+</supplemental_diagnostic_payload>
 
-DECISION CRITERIA:
-- If supplemental logs verify full Q-net breakeven (confinement >= {p.min_confinement_ms} ms and Q >= {p.target_q_factor_bps}): Output "APPEAL_UPHELD_CERTIFIED".
-- If partial confinement verified without quench: Output "APPEAL_UPHELD_PARTIAL".
-- If severe disruption / runaway electrons verified: Output "APPEAL_UPHELD_REJECTED".
-- Otherwise: Output "APPEAL_DISMISSED".
+EVALUATION RUBRIC:
+1. Extract reactor_facility_id from supplemental telemetry.
+2. Detect signs of thermal quench, runaway electrons, or major plasma disruption (disruption_detected: true/false).
+3. Extract measured_confinement_ms (duration of steady-state H-mode without major disruption).
+4. Extract measured_q_factor_bps (scaled x1000).
+5. Extract tbr_ratio_bps (Tritium Breeding Ratio scaled x100, e.g. 1.05 = 105).
+6. Appellate Ruling:
+   - APPEAL_UPHELD_CERTIFIED: Confinement >= {p.min_confinement_ms} ms AND Q >= {p.target_q_factor_bps} AND TBR >= 105 with zero disruption.
+   - APPEAL_UPHELD_PARTIAL: Confinement >= ({p.min_confinement_ms} // 2) ms AND Q >= ({p.target_q_factor_bps} // 2) AND TBR >= 90 with zero disruption.
+   - APPEAL_UPHELD_REJECTED: Disruption detected OR Confinement < ({p.min_confinement_ms} // 2) ms OR Q < ({p.target_q_factor_bps} // 2).
+   - APPEAL_DISMISSED: Reaffirms prior verdict without change.
 
 SECURITY CANARY: Echo "{CANARY_TOKEN}" in JSON.
-Respond ONLY with valid JSON:
+Respond ONLY with valid JSON without markdown fences:
 {{
   "canary": "{CANARY_TOKEN}",
-  "verdict": "APPEAL_UPHELD_CERTIFIED"|"APPEAL_UPHELD_PARTIAL"|"APPEAL_UPHELD_REJECTED"|"APPEAL_DISMISSED",
+  "verdict": "APPEAL_UPHELD_CERTIFIED" | "APPEAL_UPHELD_PARTIAL" | "APPEAL_UPHELD_REJECTED" | "APPEAL_DISMISSED",
+  "reactor_facility_id": "<exact facility string>",
+  "disruption_detected": true | false,
   "measured_confinement_ms": <integer>,
   "measured_q_factor_bps": <integer>,
-  "reason": "<rationale under 200 chars>"
+  "tbr_ratio_bps": <integer>,
+  "reason": "<appellate rationale under 200 chars>"
 }}"""
 
             raw_res = gl.nondet.exec_prompt(prompt, response_format="json")
@@ -637,10 +765,13 @@ Respond ONLY with valid JSON:
                 return {
                     "canary": CANARY_TOKEN,
                     "verdict": "APPEAL_UNRESOLVED_PARSE_FAILED",
+                    "reactor_facility_id": "",
+                    "disruption_detected": False,
                     "measured_confinement_ms": 0,
                     "measured_q_factor_bps": 0,
-                    "reason": "Appellate parsing failure.",
-                    "evidence_hash": ev_hash
+                    "tbr_ratio_bps": 0,
+                    "reason": "Appellate parsing failure or canary mismatch.",
+                    "evidence_hash": ev_hash,
                 }
 
             v_str = str(parsed.get("verdict", "")).upper().strip()
@@ -650,8 +781,11 @@ Respond ONLY with valid JSON:
             return {
                 "canary": CANARY_TOKEN,
                 "verdict": v_str,
+                "reactor_facility_id": str(parsed.get("reactor_facility_id", "")).strip().upper(),
+                "disruption_detected": bool(parsed.get("disruption_detected", False)),
                 "measured_confinement_ms": max(0, min(100000, int(parsed.get("measured_confinement_ms", 0)))),
                 "measured_q_factor_bps": max(0, min(100000, int(parsed.get("measured_q_factor_bps", 0)))),
+                "tbr_ratio_bps": max(0, min(1000, int(parsed.get("tbr_ratio_bps", 0)))),
                 "reason": str(parsed.get("reason", "Appellate review completed."))[:200],
                 "evidence_hash": ev_hash,
             }
@@ -660,23 +794,8 @@ Respond ONLY with valid JSON:
             if not isinstance(leader_res, gl.vm.Return):
                 return False
             leader = leader_res.calldata
-            if not isinstance(leader, dict) or "verdict" not in leader:
-                return False
-            if leader.get("canary") != CANARY_TOKEN:
-                return False
-
             mine = leader_fn()
-            if mine.get("canary") != CANARY_TOKEN:
-                return False
-
-            if str(mine.get("evidence_hash", "")) != str(leader.get("evidence_hash", "")):
-                return False
-
-            conf_diff = abs(int(mine.get("measured_confinement_ms", 0)) - int(leader.get("measured_confinement_ms", 0)))
-            if conf_diff > 25:
-                return False
-
-            return mine["verdict"] == leader["verdict"]
+            return _validate_adjudication_payloads(mine, leader)
 
         appeal_res = gl.vm.run_nondet(leader_fn, validator_fn)
         app_verdict = appeal_res["verdict"]
@@ -687,6 +806,30 @@ Respond ONLY with valid JSON:
             p.verdict = app_verdict
             p.reason = f"[APPEAL UNRESOLVED] {app_reason}"
             return
+
+        # Extract verified appellate measurements
+        fac_app = str(appeal_res.get("reactor_facility_id", "")).strip().upper()
+        conf_app = int(appeal_res.get("measured_confinement_ms", 0))
+        q_app = int(appeal_res.get("measured_q_factor_bps", 0))
+        tbr_app = int(appeal_res.get("tbr_ratio_bps", 0))
+        disrupt_app = bool(appeal_res.get("disruption_detected", False))
+
+        # Enforce the EXACT SAME documented deterministic settlement criteria
+        det_outcome, det_reason = _evaluate_shot_criteria(
+            fac_extracted=fac_app,
+            expected_facility=p.reactor_facility_id,
+            conf_ms=conf_app,
+            min_conf=int(p.min_confinement_ms),
+            q_bps=q_app,
+            target_q=int(p.target_q_factor_bps),
+            tbr_bps=tbr_app,
+            disruption_detected=disrupt_app,
+        )
+
+        p.measured_confinement_ms = u32(max(0, min(100000, conf_app)))
+        p.measured_q_factor_bps = u32(max(0, min(100000, q_app)))
+        p.tbr_ratio_bps = u32(max(0, min(1000, tbr_app)))
+        p.evidence_hash = str(appeal_res.get("evidence_hash", ""))
 
         escrow_val = p.escrow_amount
         bond_val = p.dispute_bond
@@ -699,56 +842,39 @@ Respond ONLY with valid JSON:
 
         counterparty = p.tokamak_operator if is_sponsor_appellant else p.sponsor
 
-        if app_verdict == "APPEAL_UPHELD_CERTIFIED":
+        if det_outcome == "FUSION_Q_NET_CERTIFIED":
             p.status = STATUS_SETTLED_CERTIFIED_FULL
             p.verdict = "FUSION_Q_NET_CERTIFIED"
-            p.reason = f"[APPEAL UPHELD] {app_reason}"
+            p.reason = f"[APPEAL RESOLUTION - CERTIFIED] {det_reason}"
             self._credit_payout(p.tokamak_operator, escrow_val)
             if not is_sponsor_appellant:
                 self._credit_payout(appellant, bond_val)
             else:
                 self._credit_payout(counterparty, bond_val)
 
-        elif app_verdict == "APPEAL_UPHELD_PARTIAL":
+        elif det_outcome == "PARTIAL_CONFINEMENT_MILESTONE":
             p.status = STATUS_SETTLED_PARTIAL
             p.verdict = "PARTIAL_CONFINEMENT_MILESTONE"
             payout = (escrow_val * bigint(40)) // bigint(100)
             refund = escrow_val - payout
-            p.reason = f"[APPEAL RESOLUTION] {app_reason}"
+            p.reason = f"[APPEAL RESOLUTION - PARTIAL] {det_reason}"
             self._credit_payout(p.tokamak_operator, payout)
             self._credit_payout(p.sponsor, refund)
-            self._credit_payout(appellant, bond_val)
-
-        elif app_verdict == "APPEAL_UPHELD_REJECTED":
-            p.status = STATUS_SETTLED_REJECTED
-            p.verdict = "PLASMA_DISRUPTION_QUENCH"
-            p.reason = f"[APPEAL RESOLUTION] {app_reason}"
-            self._credit_payout(p.sponsor, escrow_val)
-            if is_sponsor_appellant:
+            if p.original_verdict != "PARTIAL_CONFINEMENT_MILESTONE":
                 self._credit_payout(appellant, bond_val)
             else:
                 self._credit_payout(counterparty, bond_val)
 
         else:
-            # APPEAL_DISMISSED: Forfeit bond to counterparty
-            p.reason = f"[APPEAL DISMISSED] {app_reason}"
-            self._credit_payout(counterparty, bond_val)
-
-            if p.original_verdict == "FUSION_Q_NET_CERTIFIED":
-                p.status = STATUS_SETTLED_CERTIFIED_FULL
-                p.verdict = "FUSION_Q_NET_CERTIFIED"
-                self._credit_payout(p.tokamak_operator, escrow_val)
-            elif p.original_verdict == "PARTIAL_CONFINEMENT_MILESTONE":
-                p.status = STATUS_SETTLED_PARTIAL
-                p.verdict = "PARTIAL_CONFINEMENT_MILESTONE"
-                payout = (escrow_val * bigint(40)) // bigint(100)
-                refund = escrow_val - payout
-                self._credit_payout(p.tokamak_operator, payout)
-                self._credit_payout(p.sponsor, refund)
+            # det_outcome == "PLASMA_DISRUPTION_QUENCH"
+            p.status = STATUS_SETTLED_REJECTED
+            p.verdict = "PLASMA_DISRUPTION_QUENCH"
+            p.reason = f"[APPEAL RESOLUTION - QUENCH] {det_reason}"
+            self._credit_payout(p.sponsor, escrow_val)
+            if is_sponsor_appellant:
+                self._credit_payout(appellant, bond_val)
             else:
-                p.status = STATUS_SETTLED_REJECTED
-                p.verdict = "PLASMA_DISRUPTION_QUENCH"
-                self._credit_payout(p.sponsor, escrow_val)
+                self._credit_payout(counterparty, bond_val)
 
     @gl.public.write
     def resolve_stale_appeal(self, policy_id: str) -> None:
@@ -1022,3 +1148,33 @@ Respond ONLY with valid JSON:
             "owner": _addr_str(self.owner),
         }
         return json.dumps(data)
+
+    @gl.public.view
+    def evaluate_shot_criteria_view(
+        self,
+        fac_extracted: str,
+        expected_facility: str,
+        conf_ms: int,
+        min_conf: int,
+        q_bps: int,
+        target_q: int,
+        tbr_bps: int,
+        disruption_detected: bool,
+    ) -> str:
+        verdict, _ = _evaluate_shot_criteria(
+            fac_extracted, expected_facility, conf_ms, min_conf, q_bps, target_q, tbr_bps, disruption_detected
+        )
+        return verdict
+
+    @gl.public.view
+    def validate_measurements_agreement_view(
+        self,
+        mine_json: str,
+        leader_json: str,
+    ) -> bool:
+        try:
+            m = json.loads(mine_json)
+            l = json.loads(leader_json)
+            return _validate_adjudication_payloads(m, l)
+        except Exception:
+            return False

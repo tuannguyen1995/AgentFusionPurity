@@ -60,8 +60,11 @@ def test_fusion_appeal_flow_overturn_to_certified(client):
                 ".*": json.dumps({
                     "canary": "CANARY_AGENT_FUSION_PURITY_V1",
                     "verdict": "APPEAL_UPHELD_CERTIFIED",
+                    "reactor_facility_id": "SPARC-EXP-02",
+                    "disruption_detected": False,
                     "measured_confinement_ms": 580,
                     "measured_q_factor_bps": 1150,
+                    "tbr_ratio_bps": 110,
                     "reason": "Recalibrated Thomson scattering validates Q=1.15 net energy gain."
                 })
             },
@@ -194,3 +197,92 @@ def test_fusion_cancel_or_reclaim_expired(client):
 
     sp_bal = int(contract.get_claimable_balance(args=[str(sponsor)]).call())
     assert sp_bal == 1500000000000000000
+
+
+def test_appeal_enforces_disruption_and_q_rules(client):
+    """
+    Steward Requirement:
+    Proves that the appellate branch strictly enforces the same deterministic criteria:
+    If an operator appeals a quench claiming certification, but supplemental telemetry
+    verifies disruption_detected or below-floor Q, the contract CANNOT settle as certified;
+    it strictly settles as PLASMA_DISRUPTION_QUENCH, forfeiting the operator's bond to the sponsor.
+    """
+    contract = client.deploy("contracts/contract.py")
+    sponsor = client.accounts[0]
+    operator = client.accounts[1]
+
+    tx_create = contract.connect(sponsor).create_fusion_shot_escrow(
+        args=[str(operator), "JET-CULHAM-04", 500, 1000, 6000],
+        value=1000000000000000000  # 1 GEN
+    )
+    policy_id = str(tx_create.return_value)
+    diag_url = "https://ccfe.ukaea.uk/diagnostics/jet_04.json"
+    contract.connect(operator).submit_shot_diagnostics(args=[policy_id, diag_url])
+
+    # Initial quench verdict
+    client.provider.make_request(
+        method="sim_installMocks",
+        params={
+            "llm_mocks": {
+                ".*": json.dumps({
+                    "canary": "CANARY_AGENT_FUSION_PURITY_V1",
+                    "verdict": "PLASMA_DISRUPTION_QUENCH",
+                    "confidence": 90,
+                    "reactor_facility_id": "JET-CULHAM-04",
+                    "disruption_detected": True,
+                    "measured_confinement_ms": 100,
+                    "measured_q_factor_bps": 200,
+                    "tbr_ratio_bps": 30,
+                    "reason": "Thermal quench"
+                })
+            },
+            "web_mocks": {
+                diag_url: {"status": 200, "body": '{"QUENCH": true}'}
+            }
+        }
+    )
+    contract.connect(operator).adjudicate_plasma_shot(args=[policy_id])
+
+    # Operator appeals claiming breakeven
+    supp_url = "https://iaea.org/audits/jet_04_appellate.json"
+    contract.connect(operator).appeal_verdict(
+        args=[policy_id, "Operator disputes quench claim", supp_url],
+        value=100000000000000000  # 0.1 GEN bond
+    )
+
+    # In appellate audit, operator's supplemental logs still show disruption_detected=True (or below-floor Q)
+    client.provider.make_request(
+        method="sim_installMocks",
+        params={
+            "llm_mocks": {
+                ".*": json.dumps({
+                    "canary": "CANARY_AGENT_FUSION_PURITY_V1",
+                    "verdict": "APPEAL_UPHELD_CERTIFIED",  # LLM erroneously says UPHELD_CERTIFIED
+                    "reactor_facility_id": "JET-CULHAM-04",
+                    "disruption_detected": True,  # But disruption was actually present!
+                    "measured_confinement_ms": 600,
+                    "measured_q_factor_bps": 1200,
+                    "tbr_ratio_bps": 110,
+                    "reason": "High power but runaway electron damage occurred."
+                })
+            },
+            "web_mocks": {
+                supp_url: {"status": 200, "body": '{"DISRUPTION": true}'}
+            }
+        }
+    )
+
+    contract.connect(operator).adjudicate_appeal(args=[policy_id])
+    p_final = json.loads(contract.get_policy(args=[policy_id]).call())
+
+    # Deterministic matrix enforces QUENCH!
+    assert p_final["status"] == 5  # STATUS_SETTLED_REJECTED
+    assert p_final["verdict"] == "PLASMA_DISRUPTION_QUENCH"
+
+    # Sponsor receives 1.0 GEN escrow + 0.1 GEN forfeited bond = 1.1 GEN
+    sp_bal = int(contract.get_claimable_balance(args=[str(sponsor)]).call())
+    assert sp_bal == 1100000000000000000
+
+    # Operator lost bond
+    op_bal = int(contract.get_claimable_balance(args=[str(operator)]).call())
+    assert op_bal == 0

@@ -6,7 +6,7 @@ export const STUDIONET_RPC_URL = 'https://studio.genlayer.com/api';
 export const STUDIO_URL = 'https://studio.genlayer.com';
 
 // Authoritative Intelligent Contract deployed on GenLayer StudioNet
-export const DEFAULT_CONTRACT_ADDRESS = '0x077c23EA77BDA377B0f92079aDdfc945845c51c0';
+export const DEFAULT_CONTRACT_ADDRESS = "0xd87D0b05b2063F06638312497BDfeedBCA7Ad0a5";
 
 export function getSavedContractAddress(): string {
   if (typeof window !== 'undefined') {
