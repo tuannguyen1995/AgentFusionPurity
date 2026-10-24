@@ -353,3 +353,8 @@ class _Client:
 @pytest.fixture
 def client():
     return _Client()
+
+
+@pytest.fixture
+def contract(client):
+    return client.deploy("contracts/contract.py")

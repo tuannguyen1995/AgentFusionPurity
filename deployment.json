@@ -3,11 +3,11 @@
   "chainId": 61999,
   "chainIdHex": "0xF22F",
   "rpcUrl": "https://studio.genlayer.com/api",
-  "contractAddress": "0xd87D0b05b2063F06638312497BDfeedBCA7Ad0a5",
-  "transactionHash": "0xf690eeec50cab10ada2bb86d6a33a60a2228552c8f1a94430d09343de42fdcf9",
+  "contractAddress": "0x448A6B2025d0Dc597Baa988550F805e165FEf66A",
+  "transactionHash": "0x367ffae28edd531963f954ea6fd7e7c2efc3c1cc9110faf18178243fad60f23f",
   "deployerAddress": "0xF34587A45C397281Ef6BDd839d4A1de2DEe393ad",
   "status": "5",
-  "deployedAt": "2026-10-24T13:51:23Z",
+  "deployedAt": "2026-10-24T14:09:40Z",
   "liveDappUrl": "https://agentfusionpurity.vercel.app",
   "githubRepo": "https://github.com/tuannguyen1995/AgentFusionPurity"
 }

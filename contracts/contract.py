@@ -2,10 +2,8 @@
 from genlayer import *
 from dataclasses import dataclass
 import json
-import hashlib
 
 CANARY_TOKEN = "CANARY_AGENT_FUSION_PURITY_V1"
-ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
 # Time & Cooling-Off Parameters
 SECONDS_PER_BLOCK = 3
@@ -16,14 +14,14 @@ DEFAULT_SHOT_EXPIRY_SECONDS = bigint(86400 * 30)                      # 30 days 
 
 # Lifecycle Statuses
 STATUS_POLICY_OPEN = u8(0)           # Sponsor deposited fusion shot grant, awaiting pulse diagnostics
-STATUS_TELEMETRY_SUBMITTED = u8(1)   # Tokamak facility submitted plasma diagnostics & TLE spectra
-STATUS_AWAITING_PAYOUT = u8(2)       # AI Astrodynamics / Fusion Jury rendered verdict, cooling-off active
+STATUS_TELEMETRY_SUBMITTED = u8(1)   # Tokamak facility submitted plasma diagnostics
+STATUS_AWAITING_PAYOUT = u8(2)       # AI Jury rendered verdict, cooling-off active
 STATUS_SETTLED_CERTIFIED_FULL = u8(3)# Confirmed Q-net Lawson criterion & stable TBR, 100% grant released
 STATUS_SETTLED_PARTIAL = u8(4)       # Partial confinement duration milestone, 40% released
 STATUS_SETTLED_REJECTED = u8(5)      # Plasma thermal quench / disruption damage, 100% refunded to sponsor
 STATUS_DISPUTED = u8(6)              # Under appellate review with 10% staked bond
 STATUS_EXPIRED_RECLAIMED = u8(7)     # Shot window expired without valid diagnostics, reclaimed by sponsor
-STATUS_UNRESOLVED = u8(8)            # Diagnostic fetch, parse, or canary failure (protected non-settling state)
+STATUS_UNRESOLVED = u8(8)            # Diagnostic fetch, parse, or canary failure
 
 
 class ContractError(Exception):
@@ -31,33 +29,8 @@ class ContractError(Exception):
     pass
 
 
-def _to_address(val) -> Address:
-    """Converts any Address, int, or str into a valid GenLayer Address instance."""
-    if isinstance(val, Address):
-        return val
-    if isinstance(val, int):
-        hex_str = f"0x{val:040x}"
-        return Address(hex_str)
-    if isinstance(val, str):
-        clean = val.strip()
-        if clean.startswith("0x") or clean.startswith("0X"):
-            return Address(clean.lower())
-        try:
-            int_val = int(clean)
-            return Address(f"0x{int_val:040x}")
-        except ValueError:
-            return Address(clean.lower())
-    if isinstance(val, (bytes, bytearray)):
-        return Address("0x" + val.hex())
-    return Address(str(val))
-
-
 def _addr_str(addr) -> str:
-    """Safely format an Address or address-like value into a lowercase hex string."""
-    if addr is None:
-        return ZERO_ADDRESS
-    if isinstance(addr, int):
-        return f"0x{addr:040x}".lower()
+    """Safely format an Address instance into a lowercase hex string."""
     try:
         return addr.as_hex.lower()
     except Exception:
@@ -67,12 +40,10 @@ def _addr_str(addr) -> str:
 def _get_sender() -> Address:
     """Safely obtain transaction sender across GenVM runtime versions."""
     try:
-        raw = gl.message.sender_address
-        return _to_address(raw)
+        return gl.message.sender_address
     except Exception:
         try:
-            raw = gl.message.sender
-            return _to_address(raw)
+            return gl.message.sender
         except Exception:
             raise ContractError("Cannot resolve sender address.")
 
@@ -118,11 +89,11 @@ def _evaluate_shot_criteria(
     """
     Unified deterministic settlement matrix for both primary and appellate adjudication.
     Enforces documented physical, radiological, and provenance thresholds:
-    1. Facility Provenance Rule: Missing or mismatched reactor facility evidence triggers rejection.
-    2. Plasma Disruption Rule: Thermal quench or runaway electrons takes absolute precedence over confinement time.
+    1. Facility Provenance Rule: Missing or mismatched reactor facility triggers rejection.
+    2. Plasma Disruption Rule: Thermal quench takes absolute precedence over confinement time.
     3. Lawson Q-Net Breakeven Rule: Confinement >= min_conf AND Q >= target_q AND TBR >= 1.05 (105 bps).
     4. Partial Confinement Milestone Rule: Confinement >= min_conf // 2 AND Q >= target_q // 2 AND TBR >= 90 bps.
-    5. Sub-critical parameters (below floor Q, below floor confinement, or low TBR) trigger Quench / Rejection.
+    5. Sub-critical parameters (below floor Q, below floor confinement, or low TBR) trigger Quench.
     """
     clean_fac = str(fac_extracted).strip().upper()
     clean_exp = str(expected_facility).strip().upper()
@@ -138,7 +109,7 @@ def _evaluate_shot_criteria(
     if disruption_detected:
         return (
             "PLASMA_DISRUPTION_QUENCH",
-            f"Disruption Quench: Destructive MHD instability or thermal quench detected during plasma discharge."
+            "Disruption Quench: Destructive MHD instability or thermal quench detected during plasma discharge."
         )
 
     conf_floor = min_conf // 2
@@ -208,7 +179,6 @@ def _validate_adjudication_payloads(mine: dict, leader: dict) -> bool:
     if bool(leader.get("disruption_detected", False)) != bool(mine.get("disruption_detected", False)):
         return False
 
-    # Confinement time tolerance: <= 25 ms
     try:
         conf_diff = abs(int(leader.get("measured_confinement_ms", 0)) - int(mine.get("measured_confinement_ms", 0)))
         if conf_diff > 25:
@@ -216,7 +186,6 @@ def _validate_adjudication_payloads(mine: dict, leader: dict) -> bool:
     except (ValueError, TypeError):
         return False
 
-    # Q-factor tolerance: <= 50 bps (0.05 Q)
     try:
         q_diff = abs(int(leader.get("measured_q_factor_bps", 0)) - int(mine.get("measured_q_factor_bps", 0)))
         if q_diff > 50:
@@ -224,7 +193,6 @@ def _validate_adjudication_payloads(mine: dict, leader: dict) -> bool:
     except (ValueError, TypeError):
         return False
 
-    # TBR ratio tolerance: <= 5 bps (0.05 TBR)
     try:
         tbr_diff = abs(int(leader.get("tbr_ratio_bps", 0)) - int(mine.get("tbr_ratio_bps", 0)))
         if tbr_diff > 5:
@@ -245,18 +213,18 @@ class FusionPolicy:
     escrow_amount: bigint          # Locked experimental subsidy
     dispute_bond: bigint           # 10% appeal stake
     reactor_facility_id: str       # Reactor chamber identifier (e.g., "SPARC-EXPERIMENTAL-01")
-    min_confinement_ms: u32        # Minimum required stable energy confinement time in milliseconds (e.g. 500 ms)
-    target_q_factor_bps: u32       # Target Q-factor in basis points (e.g., 1000 = Q 1.0 breakeven)
-    diagnostic_feed_url: str       # Accredited spectrometry/interferometer telemetry endpoint
-    evidence_hash: str             # SHA-256 snapshot of raw shot diagnostics
+    min_confinement_ms: u32        # Minimum required stable energy confinement time in ms
+    target_q_factor_bps: u32       # Target Q-factor in basis points (e.g., 1000 = Q 1.0)
+    diagnostic_feed_url: str       # Telemetry endpoint
+    evidence_hash: str             # SHA-256 snapshot of raw diagnostics
     status: u8
-    verdict: str                   # "PENDING", "FUSION_Q_NET_CERTIFIED", "PARTIAL_CONFINEMENT_MILESTONE", "PLASMA_DISRUPTION_QUENCH", "DISPUTED", "UNRESOLVED_*"
+    verdict: str
     original_verdict: str          # Preserved pre-appeal verdict
     reason: str
     confidence: u8
     measured_confinement_ms: u32   # Measured stable confinement time in ms
     measured_q_factor_bps: u32     # Measured Q-factor (basis points)
-    tbr_ratio_bps: u32             # Tritium Breeding Ratio in basis points (e.g. 108 = 1.08 TBR)
+    tbr_ratio_bps: u32             # Tritium Breeding Ratio in basis points (e.g. 108 = 1.08)
     created_at_time: bigint        # Trusted Unix timestamp when policy was created
     expires_at_time: bigint        # Trusted Unix timestamp when coverage concludes
     audit_completed_time: bigint   # Trusted Unix timestamp when AI jury rendered verdict
@@ -280,15 +248,9 @@ class Contract(gl.Contract):
     total_pending_claims: bigint
     total_withdrawn_ledger: TreeMap[str, bigint]
 
-    def __init__(self, initial_owner: Address = Address(ZERO_ADDRESS)):
-        target_owner = _to_address(initial_owner) if initial_owner is not None else Address(ZERO_ADDRESS)
-        if _addr_str(target_owner) == ZERO_ADDRESS:
-            try:
-                target_owner = _to_address(_get_sender())
-            except Exception:
-                pass
-
-        self.owner = target_owner
+    def __init__(self):
+        deployer = _get_sender()
+        self.owner = deployer
         self.total_fusion_locked = bigint(0)
         self.total_shots_settled = u32(0)
         self.policy_counter = u64(0)
@@ -297,15 +259,11 @@ class Contract(gl.Contract):
     def _resolve_pid(self, policy_id) -> str:
         return str(policy_id).strip()
 
-    def _ensure_owner(self) -> None:
-        if _addr_str(self.owner) == ZERO_ADDRESS:
-            self.owner = _to_address(_get_sender())
-
     def _credit_payout(self, recipient: Address, amount: bigint) -> None:
         """Pure Pull-Payment accounting: guarantees safe escrow disbursement."""
         if amount <= bigint(0):
             return
-        rec_str = _addr_str(_to_address(recipient))
+        rec_str = _addr_str(recipient)
         curr = self.claimable_balances.get(rec_str, bigint(0))
         self.claimable_balances[rec_str] = curr + amount
         self.total_pending_claims = self.total_pending_claims + amount
@@ -340,8 +298,6 @@ class Contract(gl.Contract):
         target_q_factor_bps: u32,
         duration_blocks: u32
     ) -> str:
-        """DeepTech sponsor locks research grant for a verifiable high-temperature plasma confinement run."""
-        self._ensure_owner()
         escrow = bigint(gl.message.value)
         if escrow <= bigint(0):
             raise ContractError("Fusion grant escrow deposit must be greater than 0 GEN.")
@@ -350,12 +306,8 @@ class Contract(gl.Contract):
         if len(clean_fac) < 4:
             raise ContractError("Valid reactor chamber ID required (>= 4 chars).")
 
-        p_addr = _to_address(tokamak_operator)
-        if _addr_str(p_addr) == ZERO_ADDRESS:
-            raise ContractError("Valid tokamak operator address required.")
-
-        s_addr = _to_address(_get_sender())
-        if _addr_str(s_addr) == _addr_str(p_addr):
+        sender = _get_sender()
+        if _addr_str(sender) == _addr_str(tokamak_operator):
             raise ContractError("Sponsor cannot designate themselves as tokamak operator.")
 
         dur_secs = bigint(int(duration_blocks) * 3 if int(duration_blocks) > 0 else int(DEFAULT_SHOT_EXPIRY_SECONDS))
@@ -364,13 +316,12 @@ class Contract(gl.Contract):
         policy_id = str(self.policy_counter)
         current_time = self._get_current_timestamp()
         expires_at = current_time + dur_secs
-        empty_addr = Address(ZERO_ADDRESS)
 
         new_policy = FusionPolicy(
             policy_id=policy_id,
-            sponsor=s_addr,
-            tokamak_operator=p_addr,
-            dispute_initiator=empty_addr,
+            sponsor=sender,
+            tokamak_operator=tokamak_operator,
+            dispute_initiator=sender,
             escrow_amount=escrow,
             dispute_bond=bigint(0),
             reactor_facility_id=clean_fac,
@@ -405,8 +356,6 @@ class Contract(gl.Contract):
         policy_id: str,
         diagnostic_feed_url: str
     ) -> None:
-        """Tokamak operator submits telemetry from laser interferometer, bolometers, and neutron detectors."""
-        self._ensure_owner()
         pid = self._resolve_pid(policy_id)
         if pid not in self.policies:
             raise ContractError(f"Policy {pid} does not exist.")
@@ -433,8 +382,6 @@ class Contract(gl.Contract):
 
     @gl.public.write
     def adjudicate_plasma_shot(self, policy_id: str) -> None:
-        """AI Plasma Physics Tribunal evaluates Lawson criterion, thermal quench signals, and Tritium breeding."""
-        self._ensure_owner()
         pid = self._resolve_pid(policy_id)
         if pid not in self.policies:
             raise ContractError(f"Policy {pid} does not exist.")
@@ -451,12 +398,14 @@ class Contract(gl.Contract):
         ):
             raise ContractError("Permission Denied: Only sponsor, tokamak operator, or owner can trigger adjudication.")
 
+        # Read storage fields outside nondet block
         feed_url = p.diagnostic_feed_url
         facility = p.reactor_facility_id
         target_q = int(p.target_q_factor_bps)
         min_confinement = int(p.min_confinement_ms)
 
         def leader_fn():
+            import hashlib
             raw_feed = ""
             try:
                 raw_feed = gl.nondet.web.render(feed_url, mode="text")
@@ -496,9 +445,9 @@ EVALUATION RUBRIC:
 4. Extract measured_q_factor_bps (ratio of fusion power out to heating power in, scaled x1000).
 5. Extract tbr_ratio_bps (Tritium Breeding Ratio scaled x100, e.g. 1.05 = 105).
 6. Decision Matrix:
-   - FUSION_Q_NET_CERTIFIED: Confinement >= {min_confinement} ms AND Q-factor >= {target_q} AND TBR >= 105 with zero disruption (100% grant released).
-   - PARTIAL_CONFINEMENT_MILESTONE: Confinement >= ({min_confinement} // 2) ms AND Q-factor >= ({target_q} // 2) AND TBR >= 90 with zero disruption (40% milestone released, 60% preserved).
-   - PLASMA_DISRUPTION_QUENCH: Thermal quench detected OR Confinement < ({min_confinement} // 2) ms OR Q-factor < ({target_q} // 2) (100% refunded to sponsor).
+   - FUSION_Q_NET_CERTIFIED: Confinement >= {min_confinement} ms AND Q-factor >= {target_q} AND TBR >= 105 with zero disruption.
+   - PARTIAL_CONFINEMENT_MILESTONE: Confinement >= ({min_confinement} // 2) ms AND Q-factor >= ({target_q} // 2) AND TBR >= 90 with zero disruption.
+   - PLASMA_DISRUPTION_QUENCH: Thermal quench detected OR Confinement < ({min_confinement} // 2) ms OR Q-factor < ({target_q} // 2).
 
 SECURITY CANARY: Echo "{CANARY_TOKEN}" in JSON.
 Respond ONLY with valid JSON without markdown fences:
@@ -573,6 +522,11 @@ Respond ONLY with valid JSON without markdown fences:
             if not isinstance(leader_res, gl.vm.Return):
                 return False
             leader = leader_res.calldata
+            if isinstance(leader, str):
+                try:
+                    leader = json.loads(leader)
+                except Exception:
+                    return False
             mine = leader_fn()
             return _validate_adjudication_payloads(mine, leader)
 
@@ -624,8 +578,6 @@ Respond ONLY with valid JSON without markdown fences:
         dispute_reason: str,
         supplemental_audit_url: str
     ) -> None:
-        """Sponsor or Operator can appeal within 24 blocks (~72s) with a 10% staked bond."""
-        self._ensure_owner()
         pid = self._resolve_pid(policy_id)
         if pid not in self.policies:
             raise ContractError(f"Policy {pid} does not exist.")
@@ -660,7 +612,7 @@ Respond ONLY with valid JSON without markdown fences:
 
         p.appeal_prior_verdict = p.verdict
         p.status = STATUS_DISPUTED
-        p.dispute_initiator = _to_address(sender)
+        p.dispute_initiator = sender
         p.dispute_bond = staked
         p.dispute_filed_time = current_time
         p.supplemental_evidence_url = clean_url
@@ -669,8 +621,6 @@ Respond ONLY with valid JSON without markdown fences:
 
     @gl.public.write
     def adjudicate_appeal(self, policy_id: str) -> None:
-        """Supreme Fusion Appellate Tribunal evaluates strictly against bound supplemental diagnostic spectra."""
-        self._ensure_owner()
         pid = self._resolve_pid(policy_id)
         if pid not in self.policies:
             raise ContractError(f"Policy {pid} does not exist.")
@@ -687,12 +637,17 @@ Respond ONLY with valid JSON without markdown fences:
         ):
             raise ContractError("Permission Denied: Only sponsor, operator, or owner can adjudicate appeal.")
 
+        # Read storage fields outside nondet block
         bound_url = p.supplemental_evidence_url
         appellant = p.dispute_initiator
         prior_verdict = p.appeal_prior_verdict
         is_sponsor_appellant = (_addr_str(appellant) == _addr_str(p.sponsor))
+        facility_id = p.reactor_facility_id
+        min_conf = int(p.min_confinement_ms)
+        target_q = int(p.target_q_factor_bps)
 
         def leader_fn():
+            import hashlib
             raw_supp = ""
             try:
                 raw_supp = gl.nondet.web.render(bound_url, mode="text")
@@ -715,11 +670,11 @@ Respond ONLY with valid JSON without markdown fences:
             ev_hash = hashlib.sha256(raw_supp.encode("utf-8")).hexdigest()
 
             prompt = f"""You are the Supreme Plasma Physics Appellate Magistrate on GenLayer.
-Evaluate bound third-party bolometer and Thomson scattering spectra for facility {p.reactor_facility_id}:
+Evaluate bound third-party bolometer and Thomson scattering spectra for facility {facility_id}:
 PRIOR VERDICT: {prior_verdict}
 APPELLANT: {'SPONSOR' if is_sponsor_appellant else 'TOKAMAK_OPERATOR'}
-MINIMUM CONFINEMENT TIME: >= {p.min_confinement_ms} ms
-TARGET Q-FACTOR: >= {p.target_q_factor_bps} basis points (e.g. 1000 = Q 1.0 net energy gain)
+MINIMUM CONFINEMENT TIME: >= {min_conf} ms
+TARGET Q-FACTOR: >= {target_q} basis points (e.g. 1000 = Q 1.0 net energy gain)
 
 SUPPLEMENTAL AUDIT DATA:
 <supplemental_diagnostic_payload>
@@ -733,9 +688,9 @@ EVALUATION RUBRIC:
 4. Extract measured_q_factor_bps (scaled x1000).
 5. Extract tbr_ratio_bps (Tritium Breeding Ratio scaled x100, e.g. 1.05 = 105).
 6. Appellate Ruling:
-   - APPEAL_UPHELD_CERTIFIED: Confinement >= {p.min_confinement_ms} ms AND Q >= {p.target_q_factor_bps} AND TBR >= 105 with zero disruption.
-   - APPEAL_UPHELD_PARTIAL: Confinement >= ({p.min_confinement_ms} // 2) ms AND Q >= ({p.target_q_factor_bps} // 2) AND TBR >= 90 with zero disruption.
-   - APPEAL_UPHELD_REJECTED: Disruption detected OR Confinement < ({p.min_confinement_ms} // 2) ms OR Q < ({p.target_q_factor_bps} // 2).
+   - APPEAL_UPHELD_CERTIFIED: Confinement >= {min_conf} ms AND Q >= {target_q} AND TBR >= 105 with zero disruption.
+   - APPEAL_UPHELD_PARTIAL: Confinement >= ({min_conf} // 2) ms AND Q >= ({target_q} // 2) AND TBR >= 90 with zero disruption.
+   - APPEAL_UPHELD_REJECTED: Disruption detected OR Confinement < ({min_conf} // 2) ms OR Q < ({target_q} // 2).
    - APPEAL_DISMISSED: Reaffirms prior verdict without change.
 
 SECURITY CANARY: Echo "{CANARY_TOKEN}" in JSON.
@@ -794,20 +749,23 @@ Respond ONLY with valid JSON without markdown fences:
             if not isinstance(leader_res, gl.vm.Return):
                 return False
             leader = leader_res.calldata
+            if isinstance(leader, str):
+                try:
+                    leader = json.loads(leader)
+                except Exception:
+                    return False
             mine = leader_fn()
             return _validate_adjudication_payloads(mine, leader)
 
         appeal_res = gl.vm.run_nondet(leader_fn, validator_fn)
         app_verdict = appeal_res["verdict"]
-        app_reason = appeal_res["reason"]
 
         if app_verdict.startswith("APPEAL_UNRESOLVED_"):
             p.status = STATUS_UNRESOLVED
             p.verdict = app_verdict
-            p.reason = f"[APPEAL UNRESOLVED] {app_reason}"
+            p.reason = f"[APPEAL UNRESOLVED] {appeal_res['reason']}"
             return
 
-        # Extract verified appellate measurements
         fac_app = str(appeal_res.get("reactor_facility_id", "")).strip().upper()
         conf_app = int(appeal_res.get("measured_confinement_ms", 0))
         q_app = int(appeal_res.get("measured_q_factor_bps", 0))
@@ -819,9 +777,9 @@ Respond ONLY with valid JSON without markdown fences:
             fac_extracted=fac_app,
             expected_facility=p.reactor_facility_id,
             conf_ms=conf_app,
-            min_conf=int(p.min_confinement_ms),
+            min_conf=min_conf,
             q_bps=q_app,
-            target_q=int(p.target_q_factor_bps),
+            target_q=target_q,
             tbr_bps=tbr_app,
             disruption_detected=disrupt_app,
         )
@@ -835,7 +793,7 @@ Respond ONLY with valid JSON without markdown fences:
         bond_val = p.dispute_bond
         total_settling = escrow_val + bond_val
         p.dispute_bond = bigint(0)
-        p.escrow_amount = bigint(0)  # Double-payout protection
+        p.escrow_amount = bigint(0)
 
         self.total_fusion_locked = self.total_fusion_locked - total_settling
         self.total_shots_settled = self.total_shots_settled + u32(1)
@@ -866,7 +824,6 @@ Respond ONLY with valid JSON without markdown fences:
                 self._credit_payout(counterparty, bond_val)
 
         else:
-            # det_outcome == "PLASMA_DISRUPTION_QUENCH"
             p.status = STATUS_SETTLED_REJECTED
             p.verdict = "PLASMA_DISRUPTION_QUENCH"
             p.reason = f"[APPEAL RESOLUTION - QUENCH] {det_reason}"
@@ -878,13 +835,6 @@ Respond ONLY with valid JSON without markdown fences:
 
     @gl.public.write
     def resolve_stale_appeal(self, policy_id: str) -> None:
-        """
-        Role: Bounded recovery for unresolved or timed-out fusion appeals.
-        Safeguards both the experimental escrow and dispute bond:
-        1. Refunds 100% of the dispute bond back to the appellant.
-        2. Restores policy to pre-appeal verdict and resets cooling-off window.
-        """
-        self._ensure_owner()
         pid = self._resolve_pid(policy_id)
         if pid not in self.policies:
             raise ContractError(f"Policy {pid} does not exist.")
@@ -918,10 +868,8 @@ Respond ONLY with valid JSON without markdown fences:
         p.dispute_bond = bigint(0)
         self.total_fusion_locked = self.total_fusion_locked - bond_val if self.total_fusion_locked >= bond_val else bigint(0)
 
-        # 1. Safely refund 100% of dispute bond to appellant via Pull-Payment ledger
         self._credit_payout(p.dispute_initiator, bond_val)
 
-        # 2. Restore policy to prior pre-appeal verdict
         p.verdict = p.appeal_prior_verdict if p.appeal_prior_verdict and p.appeal_prior_verdict != "PENDING" else "PLASMA_DISRUPTION_QUENCH"
         p.status = STATUS_AWAITING_PAYOUT
         p.audit_completed_time = current_time
@@ -929,8 +877,6 @@ Respond ONLY with valid JSON without markdown fences:
 
     @gl.public.write
     def finalize_settlement(self, policy_id: str) -> None:
-        """Role: Stakeholders or owner executes uncontested settlement strictly after cooling-off window."""
-        self._ensure_owner()
         pid = self._resolve_pid(policy_id)
         if pid not in self.policies:
             raise ContractError(f"Policy {pid} does not exist.")
@@ -953,7 +899,7 @@ Respond ONLY with valid JSON without markdown fences:
             raise ContractError("Permission Denied: Only stakeholders or owner can finalize payout.")
 
         escrow_val = p.escrow_amount
-        p.escrow_amount = bigint(0)  # Double-payout protection
+        p.escrow_amount = bigint(0)
         self.total_fusion_locked = self.total_fusion_locked - escrow_val
         self.total_shots_settled = self.total_shots_settled + u32(1)
 
@@ -974,8 +920,6 @@ Respond ONLY with valid JSON without markdown fences:
 
     @gl.public.write
     def cancel_or_reclaim(self, policy_id: str) -> None:
-        """Role: Only sponsor fund can reclaim escrow if coverage expired without diagnostics or stalled."""
-        self._ensure_owner()
         pid = self._resolve_pid(policy_id)
         if pid not in self.policies:
             raise ContractError(f"Policy {pid} does not exist.")
@@ -1002,8 +946,6 @@ Respond ONLY with valid JSON without markdown fences:
 
     @gl.public.write
     def claim_payout(self) -> None:
-        """Pull-Payment claim: Safely withdraw accrued beneficiary credits with verified delivery accounting."""
-        self._ensure_owner()
         sender = _get_sender()
         s_str = _addr_str(sender)
         bal = self.claimable_balances.get(s_str, bigint(0))
@@ -1015,7 +957,6 @@ Respond ONLY with valid JSON without markdown fences:
         except Exception as e:
             raise ContractError(f"Outbound transfer failed during claim: {str(e)}. Balance preserved.")
 
-        # Successfully delivered: clear claimable and credit withdrawn ledger
         self.claimable_balances[s_str] = bigint(0)
         self.total_pending_claims = self.total_pending_claims - bal if self.total_pending_claims >= bal else bigint(0)
         prev_w = self.total_withdrawn_ledger.get(s_str, bigint(0))
@@ -1060,28 +1001,7 @@ Respond ONLY with valid JSON without markdown fences:
         return json.dumps(data)
 
     @gl.public.view
-    def get_user_role(self, policy_id: str, account: Address) -> str:
-        pid = self._resolve_pid(policy_id)
-        acc_str = _addr_str(account)
-        if pid not in self.policies:
-            if acc_str == _addr_str(self.owner):
-                return "OWNER"
-            return "OBSERVER"
-
-        p = self.policies[pid]
-        if acc_str == _addr_str(p.sponsor):
-            return "SPONSOR"
-        if acc_str == _addr_str(p.tokamak_operator):
-            return "TOKAMAK_OPERATOR"
-        if acc_str == _addr_str(p.dispute_initiator) and acc_str != ZERO_ADDRESS:
-            return "APPELLANT"
-        if acc_str == _addr_str(self.owner):
-            return "OWNER"
-        return "OBSERVER"
-
-    @gl.public.view
     def get_remaining_cooling_off_seconds(self, policy_id: str) -> u64:
-        """Returns remaining cooling off challenge window in seconds (0 if expired or not in cooling off)."""
         pid = self._resolve_pid(policy_id)
         if pid not in self.policies:
             return u64(0)
@@ -1133,10 +1053,6 @@ Respond ONLY with valid JSON without markdown fences:
     @gl.public.view
     def get_claimable_balance(self, account: Address) -> str:
         return str(self.claimable_balances.get(_addr_str(account), bigint(0)))
-
-    @gl.public.view
-    def get_total_withdrawn(self, account: Address) -> str:
-        return str(self.total_withdrawn_ledger.get(_addr_str(account), bigint(0)))
 
     @gl.public.view
     def get_stats(self) -> str:
